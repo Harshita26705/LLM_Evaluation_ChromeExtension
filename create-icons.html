@@ -1,0 +1,130 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Icon Generator for LLM Evaluation Extension</title>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      max-width: 800px;
+      margin: 50px auto;
+      padding: 20px;
+      background: #f5f5f5;
+    }
+    .container {
+      background: white;
+      padding: 30px;
+      border-radius: 10px;
+      box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+    }
+    h1 {
+      color: #667eea;
+    }
+    canvas {
+      border: 1px solid #ddd;
+      margin: 10px;
+      display: block;
+    }
+    button {
+      background: #667eea;
+      color: white;
+      padding: 10px 20px;
+      border: none;
+      border-radius: 5px;
+      cursor: pointer;
+      font-size: 16px;
+      margin: 10px 5px;
+    }
+    button:hover {
+      background: #5568d3;
+    }
+    .instructions {
+      background: #e3f2fd;
+      padding: 15px;
+      border-radius: 5px;
+      margin-bottom: 20px;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>🎨 Icon Generator for LLM Evaluation Extension</h1>
+    
+    <div class="instructions">
+      <h3>Instructions:</h3>
+      <ol>
+        <li>Click "Generate Icons" to create placeholder icons</li>
+        <li>Right-click each icon and "Save image as..."</li>
+        <li>Save them in the <code>icons/</code> folder with the correct names:
+          <ul>
+            <li>icon16.png (16x16)</li>
+            <li>icon48.png (48x48)</li>
+            <li>icon128.png (128x128)</li>
+          </ul>
+        </li>
+      </ol>
+    </div>
+
+    <button onclick="generateIcons()">Generate Icons</button>
+
+    <div id="icons-container"></div>
+  </div>
+
+  <script>
+    function generateIcons() {
+      const sizes = [16, 48, 128];
+      const container = document.getElementById('icons-container');
+      container.innerHTML = '<h3>Generated Icons (Right-click to save):</h3>';
+
+      sizes.forEach(size => {
+        const canvas = document.createElement('canvas');
+        canvas.width = size;
+        canvas.height = size;
+        canvas.id = `icon${size}`;
+        
+        const ctx = canvas.getContext('2d');
+        
+        // Create gradient background
+        const gradient = ctx.createLinearGradient(0, 0, size, size);
+        gradient.addColorStop(0, '#667eea');
+        gradient.addColorStop(1, '#764ba2');
+        ctx.fillStyle = gradient;
+        ctx.fillRect(0, 0, size, size);
+        
+        // Draw text/icon
+        ctx.fillStyle = 'white';
+        ctx.font = `bold ${size * 0.5}px Arial`;
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillText('LLM', size / 2, size / 2 - size * 0.1);
+        ctx.font = `${size * 0.25}px Arial`;
+        ctx.fillText('EVAL', size / 2, size / 2 + size * 0.15);
+        
+        // Add label
+        const label = document.createElement('p');
+        label.textContent = `icon${size}.png (${size}x${size})`;
+        label.style.margin = '5px 0';
+        
+        container.appendChild(label);
+        container.appendChild(canvas);
+        container.appendChild(document.createElement('br'));
+      });
+
+      // Add download instructions
+      const instruction = document.createElement('p');
+      instruction.style.marginTop = '20px';
+      instruction.style.padding = '10px';
+      instruction.style.background = '#fff3cd';
+      instruction.style.borderRadius = '5px';
+      instruction.innerHTML = '<strong>💡 Tip:</strong> Right-click each canvas above and select "Save image as..." to download. Save them in the <code>icons/</code> folder.';
+      container.appendChild(instruction);
+    }
+  </script>
+</body>
+</html>
+
+
+
+
+

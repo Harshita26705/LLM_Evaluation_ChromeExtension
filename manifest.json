@@ -1,0 +1,49 @@
+{
+  "manifest_version": 3,
+  "name": "LLM Evaluation Tool",
+  "version": "1.0.0",
+  "description": "Evaluate chatbot performance using logs and LLM Eval V3 dashboard API",
+  "content_security_policy": {
+    "extension_pages": "script-src 'self'; object-src 'self'"
+  },
+  "permissions": [
+    "activeTab",
+    "storage",
+    "scripting",
+    "downloads"
+  ],
+  "host_permissions": [
+    "https://router.huggingface.co/*",
+    "https://inference-api.huggingface.co/*",
+    "https://api.huggingface.co/*"
+  ],
+  "action": {
+    "default_popup": "popup.html"
+  },
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "web_accessible_resources": [
+    {
+      "resources": ["popup.html", "visualization.html", "styles.css", "visualization.js"],
+      "matches": ["<all_urls>"]
+    }
+  ]
+}
+
+
+
+
+

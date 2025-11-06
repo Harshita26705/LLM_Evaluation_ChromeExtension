@@ -1,0 +1,80 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>LLM Evaluation Tool</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <div class="container">
+    <header>
+      <h1>🤖 LLM Evaluation Tool</h1>
+      <p class="subtitle">Evaluate your chatbot performance</p>
+    </header>
+
+    <div class="section">
+      <h2>Step 1: Extract Logs</h2>
+      <button id="extractLogs" class="btn btn-primary">
+        📋 Extract Chatbot Logs
+      </button>
+      <div id="logStatus" class="status-message"></div>
+    </div>
+
+    <div class="section">
+      <h2>Step 2: Configure API</h2>
+      <label for="apiEndpoint">Hugging Face Space URL:</label>
+      <input 
+        type="text" 
+        id="apiEndpoint" 
+        placeholder="https://harshitasuri-llm-eval-v3.hf.space"
+        class="input-field"
+      />
+      <small class="hint">Default: LLM Eval V3 by HarshitaSuri</small>
+
+      <label for="hfApiKey">Hugging Face API Key (optional):</label>
+      <input
+        type="password"
+        id="hfApiKey"
+        placeholder="hf_xxx..."
+        class="input-field"
+      />
+      <button id="saveApiKeyBtn" class="btn btn-secondary">Save API Key</button>
+      <small class="hint">If you provide an HF token, embedding-based similarity will be used (all-MiniLM-L6-v2).</small>
+    </div>
+
+    <div class="section">
+      <h2>Step 3: Run Evaluation</h2>
+      <button id="evaluateBtn" class="btn btn-success" disabled>
+        🚀 Evaluate Performance
+      </button>
+      <div id="evaluationStatus" class="status-message"></div>
+    </div>
+
+    <div id="results" class="results-section hidden">
+      <h2>Evaluation Results</h2>
+      <div id="resultsContent" class="results-content"></div>
+      <div class="results-actions">
+        <button id="exportBtn" class="btn btn-secondary">
+          📥 Export as CSV
+        </button>
+        <button id="openDashboardBtn" class="btn btn-outline">
+          🔗 Open Dashboard
+        </button>
+      </div>
+    </div>
+
+    <div id="logsPreview" class="logs-preview hidden">
+      <h3>Extracted Logs Preview</h3>
+      <pre id="logsContent" class="logs-content"></pre>
+    </div>
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>
+
+
+
+
+
