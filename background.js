@@ -1,4 +1,18 @@
 // Background script for LLM evaluation
+// 
+// This script uses the robust scoring engine (scoring-engine.js) which provides:
+// - Weighted Jaccard similarity with TF-IDF
+// - ROUGE-1 F1 scores
+// - Exponentially smoothed length appropriateness
+// - Convex toxicity/bias penalties
+// - Coherence as blend of uncertainty and relevance
+// - Safety gate for high toxicity
+//
+// Note: scoring-engine.js functions are imported/included below
+
+// Import scoring engine functions
+importScripts('scoring-engine.js');
+
 let evaluationCache = new Map();
 
 // Listen for messages from the popup and content scripts
@@ -21,78 +35,53 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         sendResponse({ success: true });
       });
       return true;
-
-    case 'setApiKey':
-      // Save API key (user-provided) into chrome.storage.local
-      chrome.storage.local.set({ hfApiKey: request.apiKey }, () => {
-        sendResponse({ success: true });
-      });
-      return true;
-
-    case 'getApiKey':
-      chrome.storage.local.get(['hfApiKey'], (res) => {
-        sendResponse({ apiKey: res.hfApiKey || null });
-      });
-      return true;
-    case 'testHfConnection':
-      // Quick connectivity test to Hugging Face using saved API key
-      (async () => {
-        const { hfApiKey } = await new Promise(resolve => chrome.storage.local.get(['hfApiKey'], res => resolve(res)));
-        if (!hfApiKey) {
-          sendResponse({ success: false, error: 'No API key saved' });
-          return;
-        }
-
-        try {
-          // small test input
-          const sample = ['hello world'];
-          const embeddings = await fetchHfEmbeddings(sample, hfApiKey);
-          if (embeddings && embeddings.length > 0) {
-            sendResponse({ success: true, details: 'OK' });
-          } else {
-            sendResponse({ success: false, error: 'No embeddings returned' });
-          }
-        } catch (err) {
-          sendResponse({ success: false, error: err.message || String(err) });
-        }
-      })();
-      return true;
   }
 });
 
 async function analyzeLogs(logs) {
     try {
-    // Try to use a hosted embeddings API if an API key is configured (Hugging Face)
-    const { hfApiKey } = await new Promise(resolve => chrome.storage.local.get(['hfApiKey'], res => resolve(res)));
-
+    // Use TF-IDF weighted Jaccard similarity (local, no external API)
     let similarityScore = calculateBasicSimilarity(logs);
 
-    if (hfApiKey) {
-      try {
-        const texts = logs.map(l => l.content || '');
-        const embeddings = await fetchHfEmbeddings(texts, hfApiKey);
-        if (embeddings && embeddings.length === texts.length) {
-          // compute average pairwise cosine similarity between consecutive messages
-          let total = 0;
-          let cnt = 0;
-          for (let i = 0; i < embeddings.length - 1; i++) {
-            total += cosineSimilarity(embeddings[i], embeddings[i + 1]);
-            cnt++;
-          }
-          if (cnt > 0) similarityScore = total / cnt;
-        }
-      } catch (err) {
-        console.warn('HF embeddings failed, falling back to basic similarity:', err.message || err);
-      }
+    // Use the new robust scoring engine
+    let scoringResults;
+    try {
+      scoringResults = calculateOverallScore(logs);
+    } catch (e) {
+      console.error('Scoring error:', e);
+      // Fallback to defaults if scoring fails
+      scoringResults = {
+        relevance: 0.5,
+        lengthFit: 0.75,
+        coherence: 0.5,
+        rouge1: 0,
+        toxicity: 0.8,
+        bias: 0.8,
+        hallucination: 0.8,
+        overallScore: 0.5,
+        safetyGateTriggered: false
+      };
     }
-
+    
+    console.log('Individual metrics calculated:', scoringResults);
+    
     const results = {
-      similarity: similarityScore,
-      toxicity: analyzeBasicToxicity(logs),
-      hallucination: estimateHallucination(logs),
-      bias: analyzeBasicBias(logs),
-      bleuScore: calculateSimpleBLEU(logs)
+      relevance: scoringResults.relevance,
+      length_appropriateness: scoringResults.lengthFit,
+      coherence: scoringResults.coherence,
+      rouge1: scoringResults.rouge1,
+      toxicity: scoringResults.toxicity,
+      bias: scoringResults.bias,
+      hallucination: scoringResults.hallucination,
+      overall_score: scoringResults.overallScore,
+      safety_gate_triggered: scoringResults.safetyGateTriggered,
+      // Include raw penalties for transparency
+      toxicity_penalty: scoringResults.toxicityPenalty,
+      bias_penalty: scoringResults.biasPenalty,
+      hallucination_risk: scoringResults.hallucinationRisk
     };
+
+    console.log('analyzeLogs returning results:', results);
 
     // Store results in history
     await storeEvaluation(results, logs);
@@ -100,6 +89,7 @@ async function analyzeLogs(logs) {
     return results;
     } catch (error) {
         console.error('Analysis error:', error);
+        console.error('Error stack:', error.stack);
         return {
             error: 'Failed to analyze logs: ' + error.message
         };
@@ -109,11 +99,11 @@ async function analyzeLogs(logs) {
 // Fetch embeddings from Hugging Face Inference API (feature-extraction pipeline)
 async function fetchHfEmbeddings(texts, hfApiKey, modelName = 'sentence-transformers/all-MiniLM-L6-v2') {
   if (!Array.isArray(texts)) texts = [texts];
-  // Primary and fallback endpoints. Include the official api-inference host which is commonly used.
+  // Primary and fallback endpoints. Drop deprecated api-inference host to avoid 410s.
   const endpoints = [
     `https://router.huggingface.co/hf-inference/pipeline/feature-extraction/${encodeURIComponent(modelName)}`,
-    `https://inference-api.huggingface.co/models/${encodeURIComponent(modelName)}`,
-    `https://api-inference.huggingface.co/models/${encodeURIComponent(modelName)}`
+    `https://router.huggingface.co/feature-extraction/${encodeURIComponent(modelName)}`,
+    `https://inference-api.huggingface.co/models/${encodeURIComponent(modelName)}`
   ];
 
   // Helper: sleep for ms
@@ -154,7 +144,10 @@ async function fetchHfEmbeddings(texts, hfApiKey, modelName = 'sentence-transfor
 
         if (!resp.ok) {
           const errorText = await resp.text();
-          throw new Error(`API request failed: ${resp.status} - ${errorText}`);
+          const note = resp.status === 410
+            ? ' (api-inference.huggingface.co is deprecated; use router.huggingface.co)'
+            : '';
+          throw new Error(`API request failed: ${resp.status} - ${errorText}${note}`);
         }
 
         const data = await resp.json();
@@ -219,52 +212,96 @@ function cosineSimilarity(a, b) {
 }
 
 function calculateBasicSimilarity(logs) {
-    if (logs.length < 2) return 0;
-    
-    let totalSimilarity = 0;
-    let comparisons = 0;
-    
-    for (let i = 0; i < logs.length - 1; i++) {
-        const current = logs[i].content.toLowerCase();
-        const next = logs[i + 1].content.toLowerCase();
-        
-        // Calculate word overlap similarity
-        const currentWords = new Set(current.split(/\s+/));
-        const nextWords = new Set(next.split(/\s+/));
-        const intersection = new Set([...currentWords].filter(x => nextWords.has(x)));
-        const union = new Set([...currentWords, ...nextWords]);
-        
-        const similarity = intersection.size / union.size;
-        totalSimilarity += similarity;
-        comparisons++;
-    }
-    
-    return comparisons > 0 ? totalSimilarity / comparisons : 0;
+    // Use the new weighted TF-IDF similarity
+    return calculateWeightedSimilarity(logs);
 }
 
+// DEPRECATED: Use calculateRelevance from scoring-engine.js instead
+// Kept for backward compatibility only
+function calculateRelevanceLegacy(logs) {
+    let totalRelevance = 0;
+    let pairs = 0;
+    
+    // Find user-assistant pairs and measure relevance
+    for (let i = 0; i < logs.length - 1; i++) {
+        if (logs[i].role && logs[i].role.toLowerCase().includes('user') &&
+            logs[i + 1].role && logs[i + 1].role.toLowerCase().includes('assistant')) {
+            
+            const question = logs[i].content.toLowerCase();
+            const answer = logs[i + 1].content.toLowerCase();
+            
+            // Extract key terms from question (words longer than 3 chars)
+            const qWords = question.split(/\s+/).filter(w => w.length > 3);
+            const answerWords = new Set(answer.split(/\s+/));
+            
+            // Count how many question keywords appear in answer
+            const relevantWords = qWords.filter(w => answerWords.has(w)).length;
+            const relevanceScore = qWords.length > 0 ? relevantWords / qWords.length : 0.5;
+            
+            totalRelevance += relevanceScore;
+            pairs++;
+        }
+    }
+    
+    return pairs > 0 ? Math.min(1, totalRelevance / pairs) : 0.5;
+}
+
+// DEPRECATED: Use calculateToxicityPenalty from scoring-engine.js instead
+// Kept for backward compatibility only
 function analyzeBasicToxicity(logs) {
     const toxicWords = new Set([
         'hate', 'stupid', 'dumb', 'idiot', 'fool', 'terrible',
-        'horrible', 'awful', 'bad', 'worst', 'evil'
+        'horrible', 'awful', 'bad', 'worst', 'evil', 'sucks', 'disgusting'
     ]);
     
     let toxicCount = 0;
     let totalWords = 0;
     
     logs.forEach(log => {
-        const words = log.content.toLowerCase().split(/\s+/);
-        totalWords += words.length;
-        words.forEach(word => {
-            if (toxicWords.has(word)) toxicCount++;
-        });
+        if (log.content) {
+            const words = log.content.toLowerCase().split(/\s+/);
+            totalWords += words.length;
+            words.forEach(word => {
+                // Remove punctuation for matching
+                const cleanWord = word.replace(/[^a-z0-9]/g, '');
+                if (toxicWords.has(cleanWord)) {
+                    toxicCount++;
+                }
+            });
+        }
     });
     
-  // Return toxicity as a fraction [0,1] where 0 = no toxicity and 1 = highly toxic
-  if (totalWords === 0) return 0;
-  const score = toxicCount / totalWords;
-  return Math.max(0, Math.min(1, score));
+    // Return toxicity score in range 0-1 (0 = no toxicity, 1 = high toxicity)
+    if (totalWords === 0) return 0;
+    return Math.min(1, toxicCount / totalWords);
 }
 
+// DEPRECATED: Use calculateCoherence from scoring-engine.js instead
+// Kept for backward compatibility only
+function analyzeCoherence(logs) {
+    const incoherenceMarkers = ['i think', 'maybe', 'probably', 'might be', 'could be', 'not sure', 'unclear'];
+    
+    let markerCount = 0;
+    let totalResponses = 0;
+    
+    logs.forEach(log => {
+        if (log.role && log.role.toLowerCase().includes('assistant')) {
+            totalResponses++;
+            const content = (log.content || '').toLowerCase();
+            incoherenceMarkers.forEach(marker => {
+                if (content.includes(marker)) markerCount++;
+            });
+        }
+    });
+    
+    // Return coherence score (higher is better, 0-1)
+    if (totalResponses === 0) return 0.5;
+    const normalized = markerCount / totalResponses;
+    return Math.max(0, 1 - normalized);
+}
+
+// DEPRECATED: Use calculateHallucinationRisk from scoring-engine.js instead
+// Kept for backward compatibility only
 function estimateHallucination(logs) {
     const uncertaintyPhrases = [
         'i think', 'maybe', 'probably', 'might be', 'could be',
@@ -291,31 +328,42 @@ function estimateHallucination(logs) {
   return Math.max(0, Math.min(1, normalized));
 }
 
+// DEPRECATED: Use calculateBiasPenalty from scoring-engine.js instead
+// Kept for backward compatibility only
 function analyzeBasicBias(logs) {
     const biasTerms = {
         gender: ['he', 'she', 'man', 'woman', 'male', 'female'],
-        race: ['black', 'white', 'asian', 'hispanic'],
-        age: ['young', 'old', 'elderly', 'kid']
+        race: ['black', 'white', 'asian', 'hispanic', 'arab', 'jew'],
+        age: ['young', 'old', 'elderly', 'kid', 'senior', 'teenager'],
+        religion: ['christian', 'muslim', 'jewish', 'hindu', 'buddhist']
     };
     
     let biasCount = 0;
     let totalWords = 0;
     
     logs.forEach(log => {
-        const words = log.content.toLowerCase().split(/\s+/);
-        totalWords += words.length;
-        
-        words.forEach(word => {
+        if (log.content) {
+            const content = log.content.toLowerCase();
+            const words = content.split(/\s+/);
+            totalWords += words.length;
+            
+            // Check for bias terms using word boundaries
             Object.values(biasTerms).forEach(terms => {
-                if (terms.includes(word)) biasCount++;
+                terms.forEach(term => {
+                    // Count occurrences of bias terms
+                    const regex = new RegExp('\\b' + term + '\\b', 'g');
+                    const matches = content.match(regex);
+                    if (matches) {
+                        biasCount += matches.length;
+                    }
+                });
             });
-        });
+        }
     });
     
-  // Return bias metric as fraction [0,1] where 0 = no bias terms detected and 1 = many bias terms
-  if (totalWords === 0) return 0;
-  const score = biasCount / totalWords;
-  return Math.max(0, Math.min(1, score));
+    // Return bias score in range 0-1 (0 = no bias, 1 = high bias)
+    if (totalWords === 0) return 0;
+    return Math.min(1, biasCount / totalWords);
 }
 
 function calculateSimpleBLEU(logs) {
@@ -452,51 +500,22 @@ async function handleEvaluation(logs, apiEndpoint) {
 
 async function callEvaluationAPI(evaluationData) {
   try {
-    // Get API key from storage
-    const { hfApiKey } = await new Promise(resolve => 
-      chrome.storage.local.get(['hfApiKey'], res => resolve(res))
-    );
-
-    if (!hfApiKey) {
-      throw new Error('API key required for evaluation. Please add your Hugging Face API key in the extension settings.');
-    }
-
     // Input validation
     if (!evaluationData || !evaluationData.logs || !Array.isArray(evaluationData.logs)) {
       throw new Error('Invalid evaluation data format');
     }
 
-    // Extract text for embeddings
-    const conversations = evaluationData.logs.map(log => log.content).filter(Boolean);
-    
-    // Get embeddings using the fetchHfEmbeddings function
-    const embeddings = await fetchHfEmbeddings(conversations, hfApiKey);
-
-    // Calculate semantic similarities
-    const similarities = [];
-    for (let i = 0; i < embeddings.length - 1; i++) {
-      const similarity = cosineSimilarity(embeddings[i], embeddings[i + 1]);
-      similarities.push(similarity);
-    }
-
-    // Calculate average similarity
-    const avgSimilarity = similarities.length > 0 
-      ? similarities.reduce((a, b) => a + b, 0) / similarities.length 
-      : null;
-
-    // Build evaluation results using local analysis functions
+    // Build evaluation results using local analysis functions (TF-IDF + scoring engine)
     const results = {
-      embeddings_similarity: avgSimilarity,
       toxicity_scores: analyzeBasicToxicity(evaluationData.logs),
       hallucination_score: estimateHallucination(evaluationData.logs),
       bias_metrics: analyzeBasicBias(evaluationData.logs),
       bleu_score: calculateSimpleBLEU(evaluationData.logs),
-      raw_embeddings: embeddings,
-      message_pairs: similarities.length,
+      message_pairs: evaluationData.logs.length,
       metadata: {
         ...evaluationData.metadata,
         timestamp: new Date().toISOString(),
-        model: 'sentence-transformers/all-MiniLM-L6-v2'
+        similarity_method: 'TF-IDF Weighted Jaccard (Local)'
       }
     };
 
@@ -504,8 +523,7 @@ async function callEvaluationAPI(evaluationData) {
 
   } catch (error) {
     console.error('Evaluation API error:', error);
-    if (error.message.includes('Failed to fetch')) {
-      throw new Error('Failed to connect to Hugging Face API. Please check your internet connection and try again.');
+    throw error;
     }
     throw error;
   }

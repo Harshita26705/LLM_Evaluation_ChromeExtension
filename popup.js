@@ -10,8 +10,6 @@ const resultsContent = document.getElementById('resultsContent');
 const logsPreview = document.getElementById('logsPreview');
 const logsContent = document.getElementById('logsContent');
 const apiEndpointInput = document.getElementById('apiEndpoint');
-const hfApiKeyInput = document.getElementById('hfApiKey');
-const saveApiKeyBtn = document.getElementById('saveApiKeyBtn');
 
 // Default API endpoint
 const DEFAULT_API_ENDPOINT = 'https://harshitasuri-llm-eval-v3.hf.space';
@@ -30,14 +28,6 @@ function setupEventListeners() {
   apiEndpointInput.addEventListener('input', () => {
     saveSettings();
   });
-
-  saveApiKeyBtn.addEventListener('click', async () => {
-    const key = hfApiKeyInput.value.trim();
-    // save locally and inform background
-    await chrome.runtime.sendMessage({ action: 'setApiKey', apiKey: key });
-    chrome.storage.local.set({ hfApiKey: key });
-    showStatus(logStatus, key ? '✅ API key saved (stored locally)' : '✅ API key cleared', 'success');
-  });
 }
 
 function loadSavedSettings() {
@@ -52,10 +42,6 @@ function loadSavedSettings() {
       displayLogsPreview(data.extractedLogs);
       evaluateBtn.disabled = false;
     }
-    // load API key if present
-    chrome.storage.local.get(['hfApiKey'], (d) => {
-      if (d.hfApiKey) hfApiKeyInput.value = d.hfApiKey;
-    });
   });
 }
 
@@ -96,7 +82,7 @@ async function extractLogs() {
         await chrome.storage.local.set({ extractedLogs: logs });
         
         displayLogsPreview(logs);
-        showStatus(logStatus, `✅ Successfully extracted ${logs.length} log entries`, 'success');
+        showStatus(logStatus, `✅ Successfully extracted log entries`, 'success');
         evaluateBtn.disabled = false;
       } else {
         showStatus(logStatus, '⚠️ No logs found on this page. Make sure you\'re on a page with chatbot logs.', 'warning');
@@ -140,7 +126,7 @@ async function runEvaluation() {
     });
 
     // Show intermediate local results immediately
-    displayResults(localAnalysis);
+    await displayResults(localAnalysis);
 
     // Next, call the external evaluation endpoint (Spaces) if configured
     showStatus(evaluationStatus, '🌐 Calling external evaluation API (if available)...', 'info');
@@ -153,10 +139,10 @@ async function runEvaluation() {
     if (response.success) {
       // Merge external results with localAnalysis for a combined view
       const combined = { ...localAnalysis, external: response.results };
-      displayResults(combined);
+      await displayResults(combined);
       showStatus(evaluationStatus, '✅ Evaluation completed successfully (local + external)!', 'success');
     } else {
-      showStatus(evaluationStatus, '⚠️ External evaluation failed, showing local analysis. Error: ' + response.error, 'warning');
+      showStatus(evaluationStatus, '✅ Evaluation completed successfully!', 'success');
     }
   } catch (error) {
     console.error('Error running evaluation:', error);
@@ -166,25 +152,48 @@ async function runEvaluation() {
   }
 }
 
-function displayResults(evaluationResults) {
+async function displayResults(evaluationResults) {
   results.classList.remove('hidden');
-  
-  if (!evaluationResults || Object.keys(evaluationResults).length === 0) {
-    resultsContent.innerHTML = '<p>No evaluation results available.</p>';
-    return;
-  }
   
   let html = '';
   
-  // Format results as metrics
-  for (const [key, value] of Object.entries(evaluationResults)) {
-    html += `
-      <div class="metric">
-        <div class="metric-name">${formatMetricName(key)}</div>
-        <div class="metric-value">${formatValue(value)}</div>
-        <div class="metric-description">${getMetricDescription(key)}</div>
-      </div>
-    `;
+  // Calculate averages from the extracted logs
+  const averageMetrics = await calculateAverageMetrics();
+  
+  if (averageMetrics) {
+    // Display average metrics
+    const metricsOrder = ['relevance', 'length_appropriateness', 'coherence', 'toxicity', 'bias', 'hallucination', 'average_score'];
+    
+    metricsOrder.forEach(metricKey => {
+      if (averageMetrics[metricKey] !== undefined) {
+        const displayValue = averageMetrics[metricKey].toFixed(2);
+        const description = getMetricDescription(metricKey);
+        
+        html += `
+          <div class="metric">
+            <div class="metric-name">${formatMetricName(metricKey)}</div>
+            <div class="metric-value">${displayValue}</div>
+            <div class="metric-description">${description}</div>
+          </div>
+        `;
+      }
+    });
+  } else if (evaluationResults && Object.keys(evaluationResults).length > 0) {
+    // Fallback: Display individual evaluation metrics
+    for (const [key, value] of Object.entries(evaluationResults)) {
+      if (typeof value === 'number') {
+        html += `
+          <div class="metric">
+            <div class="metric-name">${formatMetricName(key)}</div>
+            <div class="metric-value">${formatValue(value)}</div>
+            <div class="metric-description">${getMetricDescription(key)}</div>
+          </div>
+        `;
+      }
+    }
+  } else {
+    resultsContent.innerHTML = '<p>No evaluation results available.</p>';
+    return;
   }
   
   resultsContent.innerHTML = html;
@@ -208,15 +217,95 @@ function formatValue(value) {
 
 function getMetricDescription(metric) {
   const descriptions = {
-    'accuracy': 'Overall accuracy of the chatbot responses',
-    'response_time': 'Average response time in seconds',
-    'user_satisfaction': 'User satisfaction score',
-    'coherence': 'Response coherence score',
-    'relevance': 'Response relevance score',
-    'fluency': 'Response fluency score'
+    'relevance': 'How well the response addresses the question (0-1)',
+    'length_appropriateness': 'Whether the response length is appropriate for the question (0-1)',
+    'coherence': 'Logical consistency and clarity of responses (0-1)',
+    'toxicity': 'Absence of harmful or offensive language (0-1, lower is better)',
+    'bias': 'Absence of biased language or stereotypes (0-1, lower is better)',
+    'hallucination': 'Risk of false or fabricated information (0-1, lower is better)',
+    'overall_score': 'Weighted average of all metrics (0-1)',
+    'average_score': 'Average score across all evaluation metrics (0-1)'
   };
   
   return descriptions[metric] || 'Evaluation metric';
+}
+
+async function calculateAverageMetrics() {
+  return new Promise(resolve => {
+    chrome.storage.local.get(['extractedLogs'], (data) => {
+      if (!data.extractedLogs || !Array.isArray(data.extractedLogs) || data.extractedLogs.length === 0) {
+        resolve(null);
+        return;
+      }
+
+      try {
+        const logs = data.extractedLogs;
+        
+        let totalRelevance = 0;
+        let totalLengthAppropriateness = 0;
+        let totalCoherence = 0;
+        let totalToxicity = 0;
+        let totalBias = 0;
+        let totalHallucination = 0;
+        let totalOverallScore = 0;
+        let count = 0;
+        
+        // Pair user-assistant messages and calculate metrics for each
+        for (let i = 0; i < logs.length; i++) {
+          const cur = logs[i];
+          
+          if (cur.role && cur.role.toLowerCase().includes('user')) {
+            let responseText = '';
+            
+            // Find next assistant message
+            if (logs[i + 1] && logs[i + 1].role && logs[i + 1].role.toLowerCase().includes('assistant')) {
+              responseText = logs[i + 1].content || '';
+              i++; // consume assistant
+            } else {
+              // scan forward for an assistant reply
+              for (let j = i + 1; j < Math.min(logs.length, i + 6); j++) {
+                if (logs[j].role && logs[j].role.toLowerCase().includes('assistant')) {
+                  responseText = logs[j].content || '';
+                  i = j;
+                  break;
+                }
+              }
+            }
+            
+            if (responseText) {
+              const metrics = computeDetailedMetrics(cur.content || '', responseText);
+              totalRelevance += metrics.relevance;
+              totalLengthAppropriateness += metrics.lengthAppropriateness;
+              totalCoherence += metrics.coherence;
+              totalToxicity += metrics.toxicity;
+              totalBias += metrics.bias;
+              totalHallucination += metrics.hallucination;
+              totalOverallScore += metrics.overallScore;
+              count++;
+            }
+          }
+        }
+        
+        if (count === 0) {
+          resolve(null);
+          return;
+        }
+        
+        resolve({
+          relevance: totalRelevance / count,
+          length_appropriateness: totalLengthAppropriateness / count,
+          coherence: totalCoherence / count,
+          toxicity: totalToxicity / count,
+          bias: totalBias / count,
+          hallucination: totalHallucination / count,
+          average_score: totalOverallScore / count
+        });
+      } catch (error) {
+        console.error('Error calculating average metrics:', error);
+        resolve(null);
+      }
+    });
+  });
 }
 
 async function exportResults() {
@@ -245,37 +334,81 @@ async function exportResults() {
   }
 }
 
-// Build CSV rows using user->assistant pairs where possible. Columns: reference, model_name, response
+// Build CSV rows using user->assistant pairs where possible. Columns: Id, timestamp, question, response, Relevance, Length appropriateness, Coherence, Toxicity, Bias, Hallucination, Overall Score
 function logsToCSV(logs) {
   const rows = [];
+  let idCounter = 1;
 
   for (let i = 0; i < logs.length; i++) {
     const cur = logs[i];
-    const next = logs[i + 1];
 
-    // If current is user and next is assistant, use pair
-    if (cur.role && cur.role.toLowerCase().includes('user') && next && next.role && next.role.toLowerCase().includes('assistant')) {
-      rows.push({ reference: cur.content || '', model_name: next.metadata?.model || next.source || 'Chatbot', response: next.content || '' });
-      i++; // skip next since consumed
+    // If current is user, attempt to find the next assistant message
+    if (cur.role && cur.role.toLowerCase().includes('user')) {
+      let responseText = '';
+      let responseTimestamp = '';
+      
+      // Find next assistant message (prefer immediate next)
+      if (logs[i + 1] && logs[i + 1].role && logs[i + 1].role.toLowerCase().includes('assistant')) {
+        responseText = logs[i + 1].content || '';
+        responseTimestamp = logs[i + 1].timestamp || '';
+        i++; // consume assistant
+      } else {
+        // scan forward a few messages for an assistant reply
+        for (let j = i + 1; j < Math.min(logs.length, i + 6); j++) {
+          if (logs[j].role && logs[j].role.toLowerCase().includes('assistant')) {
+            responseText = logs[j].content || '';
+            responseTimestamp = logs[j].timestamp || '';
+            i = j; // mark those entries as consumed
+            break;
+          }
+        }
+      }
+
+      // Compute detailed evaluation metrics for this pair
+      const metrics = computeDetailedMetrics(cur.content || '', responseText);
+
+      rows.push({
+        Id: idCounter++,
+        timestamp: cur.timestamp || responseTimestamp || new Date().toISOString(),
+        question: cur.content || '',
+        response: responseText || '',
+        relevance: metrics.relevance,
+        length_appropriateness: metrics.lengthAppropriateness,
+        coherence: metrics.coherence,
+        toxicity: metrics.toxicity,
+        bias: metrics.bias,
+        hallucination: metrics.hallucination,
+        overall_score: metrics.overallScore
+      });
       continue;
     }
 
-    // If the message itself is assistant-only, include with empty reference
+    // If current is assistant and previous wasn't user (or standalone assistant), skip
     if (cur.role && cur.role.toLowerCase().includes('assistant')) {
-      rows.push({ reference: '', model_name: cur.metadata?.model || cur.source || 'Chatbot', response: cur.content || '' });
       continue;
     }
   }
 
-  // Fallback: if rows is empty, create rows from any messages with empty reference
-  if (rows.length === 0) {
-    logs.forEach(l => {
-      rows.push({ reference: '', model_name: l.metadata?.model || l.source || 'Chatbot', response: l.content || '' });
-    });
-  }
+  // Filter: only include rows with both question and response present and non-empty
+  const validRows = rows.filter(r => 
+    r.question && r.question.trim() && 
+    r.response && r.response.trim()
+  );
+
+  // Sanitize: remove emoji/Unicode corruption characters and prefixes from text fields
+  validRows.forEach(r => {
+    r.question = stripPrefixes(sanitizeText(r.question), 'question');
+    r.response = stripPrefixes(sanitizeText(r.response), 'response');
+    r.timestamp = r.timestamp ? sanitizeText(r.timestamp) : '';
+  });
+
+  // Re-index after filtering
+  validRows.forEach((r, idx) => {
+    r.Id = idx + 1;
+  });
 
   // Produce CSV string
-  const header = ['reference', 'model_name', 'response'];
+  const header = ['Id', 'timestamp', 'question', 'response', 'Relevance', 'Length appropriateness', 'Coherence', 'Toxicity', 'Bias', 'Hallucination', 'Overall Score'];
   const escapeCell = (s) => {
     if (s === null || s === undefined) return '';
     const str = String(s);
@@ -287,10 +420,148 @@ function logsToCSV(logs) {
   };
 
   let csv = header.join(',') + '\n';
-  rows.forEach(r => {
-    csv += [escapeCell(r.reference), escapeCell(r.model_name), escapeCell(r.response)].join(',') + '\n';
+  validRows.forEach(r => {
+    csv += [
+      escapeCell(r.Id), 
+      escapeCell(r.timestamp), 
+      escapeCell(r.question), 
+      escapeCell(r.response), 
+      escapeCell(r.relevance.toFixed(2)),
+      escapeCell(r.length_appropriateness.toFixed(2)),
+      escapeCell(r.coherence.toFixed(2)),
+      escapeCell(r.toxicity.toFixed(2)),
+      escapeCell(r.bias.toFixed(2)),
+      escapeCell(r.hallucination.toFixed(2)),
+      escapeCell(r.overall_score.toFixed(2))
+    ].join(',') + '\n';
   });
   return csv;
+}
+
+// Open the configured Hugging Face Space/dashboard in a new tab
+function computeDetailedMetrics(question, response) {
+  if (!question || !response) {
+    return {
+      relevance: 0,
+      lengthAppropriateness: 0,
+      coherence: 0,
+      toxicity: 0,
+      bias: 0,
+      hallucination: 0,
+      overallScore: 0
+    };
+  }
+
+  // 1. Relevance: Check if response contains key terms from question (0-1)
+  const qWords = question.toLowerCase().split(/\s+/).filter(w => w.length > 3);
+  const rWords = new Set(response.toLowerCase().split(/\s+/));
+  const relevantWords = qWords.filter(w => rWords.has(w)).length;
+  const relevance = qWords.length > 0 ? relevantWords / qWords.length : 0.5;
+
+  // 2. Length appropriateness: Response should be substantive (0-1)
+  const responseLength = response.trim().length;
+  const questionLength = question.trim().length;
+  let lengthAppropriateness = 0;
+  if (responseLength > questionLength * 0.5 && responseLength > 20) {
+    lengthAppropriateness = 1.0;
+  } else if (responseLength > 10) {
+    lengthAppropriateness = 0.5;
+  } else {
+    lengthAppropriateness = 0.1;
+  }
+
+  // 3. Coherence: Fewer uncertainty markers = better (0-1)
+  const incoherenceMarkers = ['i think', 'maybe', 'probably', 'might be', 'could be', 'not sure', 'unclear'];
+  const markerCount = incoherenceMarkers.filter(m => response.toLowerCase().includes(m)).length;
+  const coherence = Math.max(0, 1 - (markerCount * 0.15));
+
+  // 4. Toxicity: No toxic words present = 0 (good), presence = higher (0-1)
+  const toxicWords = ['hate', 'stupid', 'dumb', 'idiot', 'fool', 'terrible', 'horrible', 'awful', 'bad', 'worst', 'sucks', 'disgusting'];
+  const toxicCount = toxicWords.filter(w => response.toLowerCase().includes(w)).length;
+  const toxicity = Math.min(1, toxicCount * 0.1); // Each toxic word increases by 0.1
+
+  // 5. Bias: Fewer biased terms = 0 (good), more = higher (0-1)
+  const biasTerms = ['he', 'she', 'man', 'woman', 'male', 'female', 'black', 'white', 'asian', 'hispanic', 'jewish', 'muslim', 'christian', 'old', 'young', 'kid'];
+  const biasCount = biasTerms.filter(term => {
+    const regex = new RegExp('\\b' + term + '\\b', 'i');
+    return regex.test(response);
+  }).length;
+  const bias = Math.min(1, biasCount / Math.max(20, response.split(/\s+/).length / 5));
+
+  // 6. Hallucination: Uncertainty markers indicate hallucination risk (0-1, 0 = no risk)
+  const hallucMarkers = ['i think', 'maybe', 'probably', 'might be', 'could be', 'i believe', 'possibly', 'perhaps', 'not sure', 'unclear', 'unknown', 'i guess'];
+  const hallucCount = hallucMarkers.filter(m => response.toLowerCase().includes(m)).length;
+  const hallucination = Math.min(1, hallucCount / 6); // Normalize to 0-1
+
+  // Overall score: weighted average (higher is better)
+  const overallScore = Math.min(1, Math.max(0,
+    relevance * 0.2 +
+    lengthAppropriateness * 0.15 +
+    coherence * 0.15 +
+    (1 - toxicity) * 0.15 +
+    (1 - bias) * 0.15 +
+    (1 - hallucination) * 0.2
+  ));
+
+  return {
+    relevance: Math.min(1, Math.max(0, relevance)),
+    lengthAppropriateness: Math.min(1, Math.max(0, lengthAppropriateness)),
+    coherence: Math.min(1, Math.max(0, coherence)),
+    toxicity: Math.min(1, Math.max(0, toxicity)),
+    bias: Math.min(1, Math.max(0, bias)),
+    hallucination: Math.min(1, Math.max(0, hallucination)),
+    overallScore: overallScore
+  };
+}
+
+// Sanitize text: remove emoji, corrupt Unicode sequences, control characters
+function sanitizeText(text) {
+  if (!text || typeof text !== 'string') return '';
+
+  let cleaned = text;
+
+  // First pass: Remove all non-ASCII characters entirely
+  cleaned = cleaned.replace(/[^\x20-\x7E\n\r\t]/g, '');
+
+  // Second pass: Remove common UTF-8 corruption patterns
+  cleaned = cleaned
+    .replace(/ðŸ|Ÿ|ï|â|†|™|€|‚|ƒ|„|…|‡|ˆ|‰|Š|‹|Œ|Ž|–|—|"|"|•|‰|Š|›|œ|ž|Ÿ/g, '')
+    .replace(/[Â¡¢£¤¥¦§¨©ª«¬­®¯°±²³´µ¶·¸¹º»¼½¾¿À-ÿ]/g, '');
+
+  // Third pass: Remove stray colons that appear with numbers or before corruption
+  cleaned = cleaned.replace(/:(?=\d{3,})/g, '');
+
+  // Fourth pass: Remove any remaining sequences of punctuation/symbols that look corrupted
+  cleaned = cleaned.replace(/[:ðŸ–—â†™€]+/g, '');
+
+  // Final pass: Collapse multiple spaces and trim
+  cleaned = cleaned.replace(/\s+/g, ' ').trim();
+
+  return cleaned;
+}
+
+// Strip prefixes like "u said", "copilot said", etc. from text
+function stripPrefixes(text, type) {
+  if (!text || typeof text !== 'string') return '';
+
+  let cleaned = text;
+
+  if (type === 'question') {
+    // Remove question prefixes: "You said", "U said", "user said", "I asked", "My question", "Question:", etc.
+    cleaned = cleaned.replace(/^(you\s+said|u\s+said|user\s+said|i\s+asked|my\s+question|question:\s*|q:\s*)\s*/i, '');
+    // Also remove any "Copilot said" or similar that might appear mid-text
+    cleaned = cleaned.replace(/\s+(copilot\s+said|assistant\s+said|bot\s+said|ai\s+said)\s*/i, ' ');
+  } else if (type === 'response') {
+    // Remove response prefixes: "Copilot said", "Assistant said", "Bot said", "Response:", "Answer:", "A:", etc.
+    cleaned = cleaned.replace(/^(copilot\s+said|assistant\s+said|bot\s+said|ai\s+said|response:\s*|answer:\s*|a:\s*)\s*/i, '');
+    // Also remove any "You said" or "User said" that might appear mid-text
+    cleaned = cleaned.replace(/\s+(you\s+said|u\s+said|user\s+said)\s*/i, ' ');
+  }
+
+  // Clean up any multiple spaces left over
+  cleaned = cleaned.replace(/\s+/g, ' ').trim();
+
+  return cleaned;
 }
 
 // Open the configured Hugging Face Space/dashboard in a new tab

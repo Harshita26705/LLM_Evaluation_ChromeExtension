@@ -1,6 +1,21 @@
 # LLM Evaluation Tool - Chrome Extension
 
-A Chrome extension that evaluates chatbot performance by extracting logs from web pages and sending them to the LLM Eval V3 dashboard API deployed on Hugging Face Spaces.
+A Chrome extension that evaluates chatbot performance using robust, mathematically sound scoring formulas including TF-IDF weighted similarity, ROUGE-1 F1, exponential penalties, and safety gates.
+
+## ✨ New: Robust Scoring Engine
+
+This extension now features a **mathematically rigorous scoring engine** with:
+
+- ✅ **Weighted Jaccard Similarity with TF-IDF** - Smarter semantic overlap detection
+- ✅ **ROUGE-1 F1 Score** - Balanced precision and recall for response quality
+- ✅ **Exponential Length Smoothing** - Smooth penalties for length deviations
+- ✅ **Convex Toxicity/Bias Penalties** - Accelerating penalties for harmful content
+- ✅ **Coherence Blending** - Combines uncertainty markers with relevance
+- ✅ **Safety Gate** - Caps overall score when toxicity exceeds threshold
+- ✅ **Normalized [0,1]** - All metrics normalized for consistency
+
+📚 **[Full Documentation](SCORING_ENGINE_DOCS.md)** | 🚀 **[Quick Start](QUICK_START.md)** | 📖 **[Migration Guide](MIGRATION_GUIDE.md)** | 📊 **[Formula Examples](FORMULA_EXAMPLES.md)**  
+📑 **[Documentation Index](DOCUMENTATION_INDEX.md)** - Complete guide to all documentation files
 
 ## Features
 
@@ -9,13 +24,15 @@ A Chrome extension that evaluates chatbot performance by extracting logs from we
   - DOM elements (chat messages)
   - Network logs (via background script)
   
-- 📊 **Performance Evaluation**: Connects to the LLM Eval V3 dashboard API to evaluate:
-  - Accuracy
-  - Response Time
-  - Coherence
-  - Relevance
-  - Fluency
-  - User Satisfaction
+- 📊 **Performance Evaluation**: Advanced metrics include:
+  - **Relevance** - TF-IDF weighted keyword recall
+  - **Length Appropriateness** - Exponentially smoothed ratio
+  - **Coherence** - Uncertainty + relevance blend
+  - **ROUGE-1 F1** - Balanced overlap score
+  - **Toxicity** - Convex penalty for harmful content
+  - **Bias** - Convex penalty for biased language
+  - **Hallucination Risk** - Calibrated uncertainty score
+  - **Overall Score** - Weighted combination with safety gate
 
 - 📥 **Export Results**: Export evaluation results as JSON for further analysis
 
@@ -72,17 +89,22 @@ The extension can extract logs from:
 
 ```
 PROJECT/
-├── manifest.json          # Extension manifest
-├── popup.html             # Extension popup UI
-├── popup.css              # Popup styles
-├── popup.js               # Popup logic
-├── content.js             # Content script for log extraction
-├── background.js          # Background service worker for API calls
-├── icons/                 # Extension icons
+├── manifest.json              # Extension manifest
+├── popup.html                 # Extension popup UI
+├── popup.css                  # Popup styles
+├── popup.js                   # Popup logic
+├── content.js                 # Content script for log extraction
+├── background.js              # Background service worker for API calls
+├── scoring-engine.js          # 🆕 Robust scoring functions (TF-IDF, ROUGE-1, etc.)
+├── test-scoring-engine.js     # 🆕 Test suite for scoring functions
+├── SCORING_ENGINE_DOCS.md     # 🆕 Complete documentation of formulas
+├── MIGRATION_GUIDE.md         # 🆕 Guide for upgrading from old system
+├── FORMULA_EXAMPLES.md        # 🆕 Numerical examples for each formula
+├── icons/                     # Extension icons
 │   ├── icon16.png
 │   ├── icon48.png
 │   └── icon128.png
-└── README.md              # This file
+└── README.md                  # This file
 ```
 
 ## API Integration
@@ -106,7 +128,20 @@ To customize the API integration for your specific Hugging Face Space:
 
 ## Development
 
-### Testing
+### Testing the Scoring Engine
+
+Run the comprehensive test suite:
+```bash
+# In Node.js environment
+node test-scoring-engine.js
+
+# Or in browser console:
+# 1. Load scoring-engine.js
+# 2. Load test-scoring-engine.js
+# All tests should pass with detailed output
+```
+
+### Testing Extension
 
 1. Load the extension in developer mode
 2. Open a webpage with chatbot logs
@@ -118,6 +153,7 @@ To customize the API integration for your specific Hugging Face Space:
 - **Popup**: Right-click extension icon → Inspect popup
 - **Content Script**: Use Chrome DevTools on the target webpage
 - **Background Script**: Go to `chrome://extensions/` → Click "service worker" link
+- **Scoring Engine**: Console.log results from `calculateOverallScore()`
 
 ## Permissions
 
