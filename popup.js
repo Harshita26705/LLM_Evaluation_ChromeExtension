@@ -12,7 +12,7 @@ const logsContent = document.getElementById('logsContent');
 const apiEndpointInput = document.getElementById('apiEndpoint');
 
 // Default API endpoint
-const DEFAULT_API_ENDPOINT = 'https://harshitasuri-llm-eval-v3.hf.space';
+const DEFAULT_API_ENDPOINT = 'https://llm-evaluation-dashboard.onrender.com/';
 
 // Initialize
 document.addEventListener('DOMContentLoaded', () => {
@@ -140,7 +140,7 @@ async function runEvaluation() {
       // Merge external results with localAnalysis for a combined view
       const combined = { ...localAnalysis, external: response.results };
       await displayResults(combined);
-      showStatus(evaluationStatus, '✅ Evaluation completed successfully (local + external)!', 'success');
+      showStatus(evaluationStatus, '✅ Evaluation completed successfully!', 'success');
     } else {
       showStatus(evaluationStatus, '✅ Evaluation completed successfully!', 'success');
     }

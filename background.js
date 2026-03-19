@@ -24,6 +24,14 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       });
       return true;
 
+    case 'evaluate':
+      evaluateWithExternalAPI(request.logs, request.apiEndpoint).then(results => {
+        sendResponse(results);
+      }).catch(error => {
+        sendResponse({ success: false, error: error.message });
+      });
+      return true;
+
     case 'getEvaluationHistory':
       chrome.storage.local.get(['evaluationHistory'], (result) => {
         sendResponse(result.evaluationHistory || []);
@@ -73,12 +81,12 @@ async function analyzeLogs(logs) {
       toxicity: scoringResults.toxicity,
       bias: scoringResults.bias,
       hallucination: scoringResults.hallucination,
-      overall_score: scoringResults.overallScore,
       safety_gate_triggered: scoringResults.safetyGateTriggered,
       // Include raw penalties for transparency
       toxicity_penalty: scoringResults.toxicityPenalty,
       bias_penalty: scoringResults.biasPenalty,
-      hallucination_risk: scoringResults.hallucinationRisk
+      hallucination_risk: scoringResults.hallucinationRisk,
+      overall_score: scoringResults.overallScore
     };
 
     console.log('analyzeLogs returning results:', results);
@@ -94,6 +102,55 @@ async function analyzeLogs(logs) {
             error: 'Failed to analyze logs: ' + error.message
         };
     }
+}
+
+// Call external evaluation API (Render deployment)
+async function evaluateWithExternalAPI(logs, apiEndpoint) {
+  try {
+    if (!apiEndpoint) {
+      throw new Error('API endpoint not configured');
+    }
+
+    // Ensure the endpoint has proper protocol
+    let url = apiEndpoint.trim();
+    if (!/^https?:\/\//i.test(url)) {
+      url = 'https://' + url;
+    }
+
+    // Remove trailing slash if present, then add /evaluate
+    url = url.replace(/\/$/, '');
+    const evaluateUrl = `${url}/evaluate`;
+
+    console.log('Calling external API:', evaluateUrl);
+
+    const response = await fetch(evaluateUrl, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ logs: logs })
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      throw new Error(`API returned ${response.status}: ${errorText}`);
+    }
+
+    const data = await response.json();
+    console.log('External API response:', data);
+
+    return {
+      success: true,
+      results: data
+    };
+
+  } catch (error) {
+    console.error('External API evaluation error:', error);
+    return {
+      success: false,
+      error: error.message
+    };
+  }
 }
 
 // Fetch embeddings from Hugging Face Inference API (feature-extraction pipeline)
@@ -527,7 +584,7 @@ async function callEvaluationAPI(evaluationData) {
     }
     throw error;
   }
-}
+
 
 function parseEvaluationResults(apiResponse) {
   if (!apiResponse || typeof apiResponse !== 'object') {

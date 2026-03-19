@@ -73,7 +73,7 @@ You can use any image editor to create these icons, or use placeholder images.
 
 The extension connects to the Hugging Face Space API. The default endpoint is:
 ```
-https://harshitasuri-llm-eval-v3.hf.space
+https://llm-evaluation-dashboard.onrender.com/
 ```
 
 You can modify this in the extension popup if you're using a different instance.
