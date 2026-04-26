@@ -10,9 +10,27 @@ const resultsContent = document.getElementById('resultsContent');
 const logsPreview = document.getElementById('logsPreview');
 const logsContent = document.getElementById('logsContent');
 const apiEndpointInput = document.getElementById('apiEndpoint');
+const sourceNameInput = document.getElementById('sourceName');
 
 // Default API endpoint
 const DEFAULT_API_ENDPOINT = 'https://llm-evaluation-dashboard.onrender.com/';
+const LOCAL_DASHBOARD_URL = 'http://127.0.0.1:5000/';
+
+function normalizeDashboardBaseUrl(rawEndpoint) {
+  let base = (rawEndpoint || '').trim();
+  if (!base) {
+    return DEFAULT_API_ENDPOINT.replace(/\/+$/, '');
+  }
+
+  if (!/^https?:\/\//i.test(base)) {
+    base = `https://${base}`;
+  }
+
+  base = base.replace(/\/+$/, '');
+  base = base.replace(/\/api\/evaluate$/i, '');
+  base = base.replace(/\/evaluate$/i, '');
+  return base;
+}
 
 // Initialize
 document.addEventListener('DOMContentLoaded', () => {
@@ -28,14 +46,23 @@ function setupEventListeners() {
   apiEndpointInput.addEventListener('input', () => {
     saveSettings();
   });
+  if (sourceNameInput) {
+    sourceNameInput.addEventListener('input', () => {
+      saveSettings();
+    });
+  }
 }
 
 function loadSavedSettings() {
-  chrome.storage.local.get(['apiEndpoint', 'extractedLogs'], (data) => {
+  chrome.storage.local.get(['apiEndpoint', 'sourceName', 'extractedLogs'], (data) => {
     if (data.apiEndpoint) {
       apiEndpointInput.value = data.apiEndpoint;
     } else {
       apiEndpointInput.value = DEFAULT_API_ENDPOINT;
+    }
+
+    if (sourceNameInput) {
+      sourceNameInput.value = data.sourceName || '';
     }
     
     if (data.extractedLogs) {
@@ -47,7 +74,8 @@ function loadSavedSettings() {
 
 function saveSettings() {
   chrome.storage.local.set({
-    apiEndpoint: apiEndpointInput.value || DEFAULT_API_ENDPOINT
+    apiEndpoint: apiEndpointInput.value || DEFAULT_API_ENDPOINT,
+    sourceName: sourceNameInput ? sourceNameInput.value.trim() : ''
   });
 }
 
@@ -109,9 +137,10 @@ async function runEvaluation() {
   results.classList.add('hidden');
   
   try {
-    const data = await chrome.storage.local.get(['extractedLogs', 'apiEndpoint']);
+    const data = await chrome.storage.local.get(['extractedLogs', 'apiEndpoint', 'sourceName']);
     const logs = data.extractedLogs;
     const apiEndpoint = data.apiEndpoint || DEFAULT_API_ENDPOINT;
+    const sourceName = (data.sourceName || '').trim();
     
     if (!logs || logs.length === 0) {
       showStatus(evaluationStatus, '❌ No logs found. Please extract logs first.', 'error');
@@ -122,7 +151,7 @@ async function runEvaluation() {
     // First, run local analysis (uses HF embeddings if API key is saved)
     showStatus(evaluationStatus, '🔎 Running local analysis (similarity, toxicity, heuristics)...', 'info');
     const localAnalysis = await new Promise(resolve => {
-      chrome.runtime.sendMessage({ action: 'analyzeLogs', logs }, (res) => resolve(res));
+      chrome.runtime.sendMessage({ action: 'analyzeLogs', logs, sourceName }, (res) => resolve(res));
     });
 
     // Show intermediate local results immediately
@@ -564,19 +593,17 @@ function stripPrefixes(text, type) {
   return cleaned;
 }
 
-// Open the configured Hugging Face Space/dashboard in a new tab
-function openDashboard() {
-  const endpoint = apiEndpointInput.value && apiEndpointInput.value.trim() ? apiEndpointInput.value.trim() : DEFAULT_API_ENDPOINT;
-  let url = endpoint;
-  // If user provided a Space root, ensure it has protocol
-  if (!/^https?:\/\//i.test(url)) url = 'https://' + url;
-
+// Open the local dashboard analytics page in a new tab.
+async function openDashboard() {
   try {
-    chrome.tabs.create({ url });
-    showStatus(logStatus, `🔗 Opening dashboard: ${url}`, 'info');
+    const targetBase = normalizeDashboardBaseUrl(LOCAL_DASHBOARD_URL);
+    const targetUrl = `${targetBase}/analytics`;
+
+    chrome.tabs.create({ url: targetUrl });
+    showStatus(logStatus, `🔗 Opening dashboard: ${targetUrl}`, 'info');
   } catch (err) {
     console.error('Failed to open dashboard tab:', err);
-    showStatus(logStatus, '❌ Could not open dashboard tab. Please open manually: ' + url, 'error');
+    showStatus(logStatus, '❌ Could not open dashboard tab. Please open manually: ' + LOCAL_DASHBOARD_URL, 'error');
   }
 }
 

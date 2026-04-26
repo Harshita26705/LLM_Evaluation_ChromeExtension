@@ -26,6 +26,9 @@ async function extractChatbotLogs() {
   
   // Strategy 3: Look for chat messages in DOM
   logs.push(...extractFromDOM());
+
+  // Strategy 3b: Fallback for image-only assistant responses.
+  logs.push(...extractStandaloneChatImagesFromDOM());
   
   // Strategy 4: Look for API responses in network logs (if available)
   logs.push(...extractFromNetworkLogs());
@@ -200,8 +203,10 @@ function extractFromDOM() {
     for (let idx = 0; idx < uniqueNodes.length; idx++) {
       const element = uniqueNodes[idx];
       try {
-        const text = element.textContent?.trim();
-        if (!text) continue;
+        const imageUrls = extractImageUrlsFromElement(element);
+        const text = element.textContent?.trim() || '';
+        if (!text && imageUrls.length === 0) continue;
+        const content = text || '[image-only message]';
 
         let role = detectRoleFromElement(element);
 
@@ -216,7 +221,8 @@ function extractFromDOM() {
         logs.push({
           timestamp: new Date().toISOString(),
           role: role,
-          content: text,
+          content,
+          imageUrls,
           source: 'DOM',
           metadata: {
             className: element.className,
@@ -231,6 +237,133 @@ function extractFromDOM() {
 
   } catch (error) {
     console.error('Error extracting from DOM:', error);
+  }
+
+  return logs;
+}
+
+function extractImageUrlsFromElement(element) {
+  const urls = [];
+  const seen = new Set();
+
+  try {
+    const images = element.querySelectorAll ? element.querySelectorAll('img') : [];
+    images.forEach((img) => {
+      const src = (img.getAttribute('src') || img.currentSrc || '').trim();
+      if (!src || seen.has(src)) return;
+      seen.add(src);
+      urls.push(src);
+    });
+  } catch (e) {
+    // Ignore extraction errors for individual DOM nodes.
+  }
+
+  return urls;
+}
+
+/**
+ * Resolve the best available URL for an <img> element.
+ * Tries in order: download-button href → share-button href → data-src → currentSrc → src.
+ * This is important for Copilot-generated images where img.src may be an internal blob
+ * but adjacent action buttons expose the real CDN URL.
+ */
+function resolveImageSrc(img) {
+  // Walk up to at most 6 ancestor levels looking for download/share action anchors
+  const IMAGE_EXTS = /\.(png|jpg|jpeg|gif|webp|bmp)(\?|$)/i;
+  let ancestor = img.parentElement;
+  for (let i = 0; i < 6 && ancestor; i++, ancestor = ancestor.parentElement) {
+    // Look for <a download> or <a href="...image..."> buttons in the same container
+    const anchors = ancestor.querySelectorAll('a[href], a[download]');
+    for (const a of anchors) {
+      const href = (a.getAttribute('href') || '').trim();
+      if (!href) continue;
+      // Absolute URL pointing to an image or containing image-related query params
+      if (
+        IMAGE_EXTS.test(href) ||
+        href.startsWith('data:image/') ||
+        href.startsWith('blob:') ||
+        /[?&](url|src|image|img|file)=/i.test(href) ||
+        /bing\.com\/images|dall-e|openai|cdn\.copilot|mediaproxy/i.test(href)
+      ) {
+        return href;
+      }
+    }
+    // Also look for buttons with data-url / data-image-url / data-download-url attributes
+    const buttons = ancestor.querySelectorAll('[data-url],[data-image-url],[data-download-url],[data-src]');
+    for (const btn of buttons) {
+      const url = (
+        btn.getAttribute('data-image-url') ||
+        btn.getAttribute('data-download-url') ||
+        btn.getAttribute('data-url') ||
+        btn.getAttribute('data-src') ||
+        ''
+      ).trim();
+      if (url) return url;
+    }
+  }
+
+  // Fallbacks on the img element itself
+  return (
+    img.getAttribute('data-src') ||
+    img.getAttribute('data-lazy-src') ||
+    img.currentSrc ||
+    img.getAttribute('src') ||
+    ''
+  ).trim();
+}
+
+function extractStandaloneChatImagesFromDOM() {
+  const logs = [];
+  const seen = new Set();
+
+  try {
+    const images = document.querySelectorAll('img');
+    images.forEach((img) => {
+      // Resolve the best URL, including from nearby download/share buttons
+      const src = resolveImageSrc(img);
+      if (!src || seen.has(src)) return;
+
+      // Use rendered dimensions; fall back to attribute dimensions only if natural size unavailable
+      const width = Number(img.naturalWidth || img.width || img.getAttribute('width') || 0);
+      const height = Number(img.naturalHeight || img.height || img.getAttribute('height') || 0);
+      const area = width * height;
+
+      // For images where naturalWidth is 0 (lazy-load not yet triggered), accept if
+      // the URL itself looks like a real image (not just any src that hasn't loaded)
+      const srcLower = src.toLowerCase();
+      const looksLikeImageUrl = (
+        srcLower.startsWith('data:image/') ||
+        srcLower.startsWith('blob:') ||
+        /\.(png|jpg|jpeg|gif|webp|bmp)(\?|$)/.test(srcLower) ||
+        /bing\.com\/images|dall-e|openai|cdn\.copilot|mediaproxy/i.test(src)
+      );
+
+      // Accept if size passes OR if the URL strongly identifies itself as an image
+      const sizeOk = width >= 120 && height >= 120 && area >= 20000;
+      if (!sizeOk && !looksLikeImageUrl) return;
+
+      // Reject obvious UI chrome
+      if (
+        srcLower.includes('icon') ||
+        srcLower.includes('avatar') ||
+        srcLower.includes('logo') ||
+        srcLower.endsWith('.svg')
+      ) return;
+
+      seen.add(src);
+
+      const role = detectRoleFromElement(img) === 'user' ? 'user' : 'assistant';
+      logs.push({
+        timestamp: new Date().toISOString(),
+        role,
+        content: '[image-only message]',
+        imageUrls: [src],
+        source: 'DOM-IMAGE-FALLBACK',
+        metadata: { width, height }
+      });
+    });
+  } catch (error) {
+    console.error('Error extracting standalone images:', error);
   }
 
   return logs;
@@ -309,10 +442,92 @@ function isValidLogEntry(entry) {
   if (!entry || typeof entry !== 'object') return false;
   
   // Check for common log entry properties
-  const hasContent = entry.content || entry.message || entry.text || entry.response || entry.answer || entry.reply || entry.prompt || entry.question || entry.input;
+  const hasContent = [
+    entry.content,
+    entry.message,
+    entry.text,
+    entry.response,
+    entry.answer,
+    entry.reply,
+    entry.prompt,
+    entry.question,
+    entry.input
+  ].some((value) => extractEntryText(value).trim().length > 0);
   const hasTimestamp = entry.timestamp || entry.time || entry.created_at;
   
   return hasContent || hasTimestamp;
+}
+
+function extractEntryText(value) {
+  if (value == null) return '';
+  if (typeof value === 'string') return value;
+  if (typeof value === 'number' || typeof value === 'boolean') return String(value);
+
+  if (Array.isArray(value)) {
+    return value
+      .map((item) => extractEntryText(item))
+      .filter((text) => text.trim().length > 0)
+      .join('\n');
+  }
+
+  if (typeof value === 'object') {
+    const obj = value;
+
+    // Common LLM block shape: { type: "text", text: "..." }
+    if (typeof obj.text === 'string' && obj.text.trim()) {
+      return obj.text;
+    }
+
+    // Common nested shape: { content: [...] }, { parts: [...] }, { results: [...] }
+    const nestedCollections = [obj.content, obj.parts, obj.results, obj.messages, obj.items];
+    for (const collection of nestedCollections) {
+      if (Array.isArray(collection)) {
+        const nestedText = extractEntryText(collection);
+        if (nestedText.trim()) {
+          return nestedText;
+        }
+      }
+    }
+
+    // Some payloads wrap content under message/body/response objects.
+    const nestedObjects = [obj.message, obj.body, obj.response, obj.data];
+    for (const nested of nestedObjects) {
+      if (nested && typeof nested === 'object') {
+        const nestedText = extractEntryText(nested);
+        if (nestedText.trim()) {
+          return nestedText;
+        }
+      }
+    }
+
+    try {
+      return JSON.stringify(obj);
+    } catch (e) {
+      return '';
+    }
+  }
+
+  return '';
+}
+
+function normalizeEntryRole(entry) {
+  const directRole = extractEntryText(entry.role || entry.type || entry.sender || entry.author_type).toLowerCase();
+  if (directRole.includes('assistant') || directRole.includes('ai') || directRole.includes('bot')) {
+    return 'assistant';
+  }
+  if (directRole.includes('user') || directRole.includes('human')) {
+    return 'user';
+  }
+
+  const authorType = extractEntryText(entry?.author?.type).toLowerCase();
+  if (authorType === 'ai' || authorType === 'assistant' || authorType === 'bot') {
+    return 'assistant';
+  }
+  if (authorType === 'user' || authorType === 'human') {
+    return 'user';
+  }
+
+  return directRole || 'unknown';
 }
 
 // Normalize a raw storage/parsed entry into one or more standard log entries
@@ -323,6 +538,7 @@ function normalizeRawEntry(entry, source) {
 
   const hasQuestion = questionKeys.some(k => entry[k] !== undefined);
   const hasAnswer = answerKeys.some(k => entry[k] !== undefined);
+  const imageUrls = extractImageUrlsFromObject(entry);
 
   const timestamp = entry.timestamp || entry.time || entry.created_at || new Date().toISOString();
 
@@ -335,7 +551,8 @@ function normalizeRawEntry(entry, source) {
     entries.push({
       timestamp,
       role: 'user',
-      content: String(questionContent),
+      content: extractEntryText(questionContent),
+      imageUrls,
       source,
       metadata: { original: entry, model: entry.model || entry.model_name }
     });
@@ -343,7 +560,8 @@ function normalizeRawEntry(entry, source) {
     entries.push({
       timestamp,
       role: 'assistant',
-      content: String(answerContent),
+      content: extractEntryText(answerContent),
+      imageUrls,
       source,
       metadata: { original: entry, model: entry.model || entry.model_name }
     });
@@ -352,18 +570,71 @@ function normalizeRawEntry(entry, source) {
   }
 
   // Fallback: if entry already has role/content fields, normalize single entry
-  const role = entry.role || entry.type || entry.sender || 'unknown';
-  const content = entry.content || entry.message || entry.text || entry.response || entry.answer || entry.reply || JSON.stringify(entry);
+  const role = normalizeEntryRole(entry);
+  const content =
+    extractEntryText(entry.content) ||
+    extractEntryText(entry.message) ||
+    extractEntryText(entry.text) ||
+    extractEntryText(entry.response) ||
+    extractEntryText(entry.answer) ||
+    extractEntryText(entry.reply) ||
+    extractEntryText(entry);
 
   entries.push({
     timestamp,
     role,
-    content: String(content),
+    content,
+    imageUrls,
     source,
     metadata: { original: entry, model: entry.model || entry.model_name }
   });
 
   return entries;
+}
+
+function extractImageUrlsFromObject(value) {
+  const collected = [];
+  const seenUrls = new Set();
+  const visited = new Set();
+
+  function maybeAdd(url) {
+    if (typeof url !== 'string') return;
+    const trimmed = url.trim();
+    if (!trimmed) return;
+    const lowered = trimmed.toLowerCase();
+    const looksLikeImage =
+      lowered.startsWith('data:image/') ||
+      lowered.startsWith('blob:') ||
+      /\.(png|jpe?g|gif|webp|bmp|svg)(\?|#|$)/i.test(trimmed);
+    if (!looksLikeImage) return;
+    if (seenUrls.has(trimmed)) return;
+    seenUrls.add(trimmed);
+    collected.push(trimmed);
+  }
+
+  function walk(node) {
+    if (!node || typeof node !== 'object') return;
+    if (visited.has(node)) return;
+    visited.add(node);
+
+    if (Array.isArray(node)) {
+      node.forEach(walk);
+      return;
+    }
+
+    Object.entries(node).forEach(([key, val]) => {
+      if (typeof val === 'string') {
+        if (/(src|image|image_url|imageurl|thumbnail|url)/i.test(key)) {
+          maybeAdd(val);
+        }
+      } else if (val && typeof val === 'object') {
+        walk(val);
+      }
+    });
+  }
+
+  walk(value);
+  return collected;
 }
 
 function deduplicateLogs(logs) {

@@ -16,7 +16,9 @@
     "https://router.huggingface.co/*",
     "https://inference-api.huggingface.co/*",
     "https://api.huggingface.co/*",
-    "https://llm-evaluation-dashboard.onrender.com/*"
+    "https://llm-evaluation-dashboard.onrender.com/*",
+    "http://localhost/*",
+    "http://127.0.0.1/*"
   ],
   "action": {
     "default_popup": "popup.html"

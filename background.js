@@ -14,13 +14,23 @@
 importScripts('scoring-engine.js');
 
 let evaluationCache = new Map();
+const LOCAL_HISTORY_ENDPOINT = 'http://127.0.0.1:5000/api/evaluation-history';
+
+async function getHistorySyncEndpoint() {
+  return LOCAL_HISTORY_ENDPOINT;
+}
 
 // Listen for messages from the popup and content scripts
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   switch (request.action) {
     case 'analyzeLogs':
-      analyzeLogs(request.logs).then(results => {
-        sendResponse(results);
+      chrome.storage.local.get(['sourceName'], (data) => {
+        const savedSourceName = (data?.sourceName || '').trim();
+        const effectiveSource = (request.sourceName || savedSourceName || sender?.tab?.url || '').trim();
+
+        analyzeLogs(request.logs, effectiveSource).then(results => {
+          sendResponse(results);
+        });
       });
       return true;
 
@@ -46,7 +56,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   }
 });
 
-async function analyzeLogs(logs) {
+async function analyzeLogs(logs, sourceUrl) {
     try {
     // Use TF-IDF weighted Jaccard similarity (local, no external API)
     let similarityScore = calculateBasicSimilarity(logs);
@@ -78,9 +88,10 @@ async function analyzeLogs(logs) {
       length_appropriateness: scoringResults.lengthFit,
       coherence: scoringResults.coherence,
       rouge1: scoringResults.rouge1,
-      toxicity: scoringResults.toxicity,
-      bias: scoringResults.bias,
-      hallucination: scoringResults.hallucination,
+      // Keep these aligned with popup semantics: lower is better (risk/penalty).
+      toxicity: scoringResults.toxicityPenalty ?? (1 - (scoringResults.toxicity ?? 0)),
+      bias: scoringResults.biasPenalty ?? (1 - (scoringResults.bias ?? 0)),
+      hallucination: scoringResults.hallucinationRisk ?? (1 - (scoringResults.hallucination ?? 0)),
       safety_gate_triggered: scoringResults.safetyGateTriggered,
       // Include raw penalties for transparency
       toxicity_penalty: scoringResults.toxicityPenalty,
@@ -91,8 +102,8 @@ async function analyzeLogs(logs) {
 
     console.log('analyzeLogs returning results:', results);
 
-    // Store results in history
-    await storeEvaluation(results, logs);
+    // Store results in history and sync the dashboard copy.
+    await storeEvaluation(results, logs, sourceUrl);
 
     return results;
     } catch (error) {
@@ -111,41 +122,75 @@ async function evaluateWithExternalAPI(logs, apiEndpoint) {
       throw new Error('API endpoint not configured');
     }
 
-    // Ensure the endpoint has proper protocol
-    let url = apiEndpoint.trim();
-    if (!/^https?:\/\//i.test(url)) {
-      url = 'https://' + url;
+    // Normalize endpoint so both full path and base URL are supported.
+    let configuredUrl = apiEndpoint.trim();
+    if (!/^https?:\/\//i.test(configuredUrl)) {
+      configuredUrl = 'https://' + configuredUrl;
+    }
+    configuredUrl = configuredUrl.replace(/\/+$/, '');
+
+    const isDirectEvaluatePath = /\/api\/evaluate$/i.test(configuredUrl) || /\/evaluate$/i.test(configuredUrl);
+    const candidateUrls = isDirectEvaluatePath
+      ? [configuredUrl]
+      : [`${configuredUrl}/api/evaluate`, `${configuredUrl}/evaluate`];
+
+    // Build one user->assistant pair for Flask /api/evaluate compatibility.
+    let firstPair = null;
+    for (let i = 0; i < logs.length - 1; i++) {
+      const current = logs[i];
+      const next = logs[i + 1];
+      const isUser = current?.role && current.role.toLowerCase().includes('user');
+      const isAssistant = next?.role && next.role.toLowerCase().includes('assistant');
+      if (isUser && isAssistant) {
+        firstPair = {
+          reference: current.content || '',
+          response: next.content || ''
+        };
+        break;
+      }
     }
 
-    // Remove trailing slash if present, then add /evaluate
-    url = url.replace(/\/$/, '');
-    const evaluateUrl = `${url}/evaluate`;
+    let lastError = null;
 
-    console.log('Calling external API:', evaluateUrl);
+    for (const evaluateUrl of candidateUrls) {
+      const isFlaskEvaluate = /\/api\/evaluate$/i.test(evaluateUrl);
+      const payload = isFlaskEvaluate
+        ? (firstPair || { reference: '', response: '' })
+        : { logs: logs };
 
-    const response = await fetch(evaluateUrl, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({ logs: logs })
-    });
+      try {
+        console.log('Calling external API:', evaluateUrl);
 
-    if (!response.ok) {
-      const errorText = await response.text();
-      throw new Error(`API returned ${response.status}: ${errorText}`);
+        const response = await fetch(evaluateUrl, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify(payload)
+        });
+
+        if (!response.ok) {
+          const errorText = await response.text();
+          throw new Error(`API returned ${response.status}: ${errorText}`);
+        }
+
+        const data = await response.json();
+        console.log('External API response:', data);
+
+        return {
+          success: true,
+          results: data
+        };
+      } catch (error) {
+        lastError = error;
+        console.warn(`External API attempt failed for ${evaluateUrl}:`, error?.message || error);
+      }
     }
 
-    const data = await response.json();
-    console.log('External API response:', data);
-
-    return {
-      success: true,
-      results: data
-    };
+    throw lastError || new Error('All external API endpoints failed');
 
   } catch (error) {
-    console.error('External API evaluation error:', error);
+    console.warn('External API evaluation error:', error?.message || error);
     return {
       success: false,
       error: error.message
@@ -446,15 +491,36 @@ function calculateSimpleBLEU(logs) {
     return pairs > 0 ? totalScore / pairs : 0;
 }
 
-async function storeEvaluation(results, logs) {
+async function storeEvaluation(results, logs, sourceUrl) {
     try {
-        const { evaluationHistory = [] } = await chrome.storage.local.get(['evaluationHistory']);
+    const { evaluationHistory = [], sourceName = '' } = await chrome.storage.local.get(['evaluationHistory', 'sourceName']);
+        const rows = buildEvaluationRows(logs);
+  const rowSummary = summarizeEvaluationRows(rows);
+    const resolvedSource = (sourceUrl || sourceName || logs[0]?.url || 'unknown').trim();
+        const session = {
+            session_id: `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`,
+            timestamp: new Date().toISOString(),
+      source_url: resolvedSource,
+            message_count: logs.length,
+            summary: {
+        // Keep history aligned with popup/UI averages (row-level metrics).
+        relevance: rowSummary.relevance,
+        length_appropriateness: rowSummary.length_appropriateness,
+        coherence: rowSummary.coherence,
+        toxicity: rowSummary.toxicity,
+        bias: rowSummary.bias,
+        hallucination: rowSummary.hallucination,
+        average_score: rowSummary.average_score,
+            }
+        };
         
         evaluationHistory.push({
-            timestamp: new Date().toISOString(),
+            timestamp: session.timestamp,
             results,
             messageCount: logs.length,
-            url: logs[0]?.url || 'unknown'
+            url: session.source_url,
+            rows,
+            session
         });
         
         // Keep only last 100 evaluations
@@ -463,9 +529,249 @@ async function storeEvaluation(results, logs) {
         }
         
         await chrome.storage.local.set({ evaluationHistory });
+
+        await syncEvaluationHistoryToDashboard({ session, rows });
     } catch (error) {
         console.error('Error storing evaluation:', error);
     }
+}
+
+async function syncEvaluationHistoryToDashboard(payload) {
+    try {
+    const historyEndpoint = await getHistorySyncEndpoint();
+    const response = await fetch(historyEndpoint, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify(payload)
+        });
+
+        if (!response.ok) {
+            const errorText = await response.text();
+            throw new Error(`Dashboard history API returned ${response.status}: ${errorText}`);
+        }
+
+        console.log('History sync successful:', historyEndpoint);
+    } catch (error) {
+        console.warn('Unable to sync evaluation history to dashboard:', error.message || error);
+    }
+    }
+
+function extractImageUrlsFromText(text) {
+  if (!text || typeof text !== 'string') return [];
+
+  const urls = [];
+  const seen = new Set();
+  const patterns = [
+    /!\[[^\]]*\]\(((?:https?:\/\/|data:image\/|blob:)[^\s)]+)\)/gi,
+    /<img[^>]+src=["']((?:https?:\/\/|data:image\/|blob:)[^"']+)["'][^>]*>/gi,
+    /((?:https?:\/\/|data:image\/|blob:)[^\s"'<>]+)/gi,
+  ];
+
+  for (const pattern of patterns) {
+    let match;
+    while ((match = pattern.exec(text)) !== null) {
+      const candidate = (match[1] || match[0] || '').trim();
+      if (!candidate) continue;
+      const lowered = candidate.toLowerCase();
+      const looksLikeImage =
+        lowered.startsWith('data:image/') ||
+        lowered.startsWith('blob:') ||
+        /\.(png|jpe?g|gif|webp|bmp|svg)(\?|#|$)/i.test(candidate);
+      if (!looksLikeImage) continue;
+      if (seen.has(candidate)) continue;
+      seen.add(candidate);
+      urls.push(candidate);
+    }
+  }
+
+  return urls;
+}
+
+function mergeUniqueUrls(...groups) {
+  const merged = [];
+  const seen = new Set();
+  for (const group of groups) {
+    const list = Array.isArray(group) ? group : [];
+    for (const item of list) {
+      const url = String(item || '').trim();
+      if (!url || seen.has(url)) continue;
+      seen.add(url);
+      merged.push(url);
+    }
+  }
+  return merged;
+}
+
+    function buildEvaluationRows(logs) {
+          const rows = [];
+          let idCounter = 1;
+
+          for (let i = 0; i < logs.length; i++) {
+            const current = logs[i];
+
+            if (current.role && current.role.toLowerCase().includes('user')) {
+              let responseText = '';
+              let responseTimestamp = '';
+              let responseImageUrls = [];
+
+              const immediate = logs[i + 1];
+              const immediateIsAssistant = immediate && immediate.role && immediate.role.toLowerCase().includes('assistant');
+              const immediateHasImage = immediate && Array.isArray(immediate.imageUrls) && immediate.imageUrls.length > 0;
+
+              if (immediate && (immediateIsAssistant || immediateHasImage)) {
+                responseText = immediate.content || '';
+                responseTimestamp = immediate.timestamp || '';
+                responseImageUrls = mergeUniqueUrls(immediate.imageUrls, extractImageUrlsFromText(responseText));
+                i++;
+              } else {
+                for (let j = i + 1; j < Math.min(logs.length, i + 6); j++) {
+                  const candidate = logs[j];
+                  const candidateIsAssistant = candidate && candidate.role && candidate.role.toLowerCase().includes('assistant');
+                  const candidateHasImage = candidate && Array.isArray(candidate.imageUrls) && candidate.imageUrls.length > 0;
+                  if (candidateIsAssistant || candidateHasImage) {
+                    responseText = candidate.content || '';
+                    responseTimestamp = candidate.timestamp || '';
+                    responseImageUrls = mergeUniqueUrls(candidate.imageUrls, extractImageUrlsFromText(responseText));
+                    i = j;
+                    break;
+                  }
+                }
+              }
+
+              const metrics = computeDetailedMetrics(current.content || '', responseText);
+
+              rows.push({
+                Id: idCounter++,
+                timestamp: current.timestamp || responseTimestamp || new Date().toISOString(),
+                question: current.content || '',
+                response: responseText || '',
+                response_image_urls: responseImageUrls,
+                Relevance: metrics.relevance,
+                'Length appropriateness': metrics.lengthAppropriateness,
+                Coherence: metrics.coherence,
+                Toxicity: metrics.toxicity,
+                Bias: metrics.bias,
+                Hallucination: metrics.hallucination,
+                'Overall Score': metrics.overallScore
+              });
+            }
+          }
+
+          return rows.filter(row => row.question && row.question.trim() && row.response && row.response.trim());
+}
+
+function computeDetailedMetrics(question, response) {
+          if (!question || !response) {
+            return {
+              relevance: 0,
+              lengthAppropriateness: 0,
+              coherence: 0,
+              toxicity: 0,
+              bias: 0,
+              hallucination: 0,
+              overallScore: 0
+            };
+          }
+
+          const qWords = question.toLowerCase().split(/\s+/).filter(w => w.length > 3);
+          const rWords = new Set(response.toLowerCase().split(/\s+/));
+          const relevantWords = qWords.filter(w => rWords.has(w)).length;
+          const relevance = qWords.length > 0 ? relevantWords / qWords.length : 0.5;
+
+          const responseLength = response.trim().length;
+          const questionLength = question.trim().length;
+          let lengthAppropriateness = 0;
+          if (responseLength > questionLength * 0.5 && responseLength > 20) {
+            lengthAppropriateness = 1.0;
+          } else if (responseLength > 10) {
+            lengthAppropriateness = 0.5;
+          } else {
+            lengthAppropriateness = 0.1;
+          }
+
+          const incoherenceMarkers = ['i think', 'maybe', 'probably', 'might be', 'could be', 'not sure', 'unclear'];
+          const markerCount = incoherenceMarkers.filter(marker => response.toLowerCase().includes(marker)).length;
+          const coherence = Math.max(0, 1 - (markerCount * 0.15));
+
+          const toxicWords = ['hate', 'stupid', 'dumb', 'idiot', 'fool', 'terrible', 'horrible', 'awful', 'bad', 'worst', 'sucks', 'disgusting'];
+          const toxicCount = toxicWords.filter(word => response.toLowerCase().includes(word)).length;
+          const toxicity = Math.min(1, toxicCount * 0.1);
+
+          const biasTerms = ['he', 'she', 'man', 'woman', 'male', 'female', 'black', 'white', 'asian', 'hispanic', 'jewish', 'muslim', 'christian', 'old', 'young', 'kid'];
+          const biasCount = biasTerms.filter(term => {
+            const regex = new RegExp('\\b' + term + '\\b', 'i');
+            return regex.test(response);
+          }).length;
+          const bias = Math.min(1, biasCount / Math.max(20, response.split(/\s+/).length / 5));
+
+          const hallucMarkers = ['i think', 'maybe', 'probably', 'might be', 'could be', 'i believe', 'possibly', 'perhaps', 'not sure', 'unclear', 'unknown', 'i guess'];
+          const hallucCount = hallucMarkers.filter(marker => response.toLowerCase().includes(marker)).length;
+          const hallucination = Math.min(1, hallucCount / 6);
+
+          const overallScore = Math.min(1, Math.max(0,
+            relevance * 0.2 +
+            lengthAppropriateness * 0.15 +
+            coherence * 0.15 +
+            (1 - toxicity) * 0.15 +
+            (1 - bias) * 0.15 +
+            (1 - hallucination) * 0.2
+          ));
+
+          return {
+            relevance: Math.min(1, Math.max(0, relevance)),
+            lengthAppropriateness: Math.min(1, Math.max(0, lengthAppropriateness)),
+            coherence: Math.min(1, Math.max(0, coherence)),
+            toxicity: Math.min(1, Math.max(0, toxicity)),
+            bias: Math.min(1, Math.max(0, bias)),
+            hallucination: Math.min(1, Math.max(0, hallucination)),
+            overallScore: overallScore
+          };
+}
+
+function summarizeEvaluationRows(rows) {
+  if (!Array.isArray(rows) || rows.length === 0) {
+    return {
+      relevance: 0,
+      length_appropriateness: 0,
+      coherence: 0,
+      toxicity: 0,
+      bias: 0,
+      hallucination: 0,
+      average_score: 0,
+    };
+  }
+
+  const totals = rows.reduce((acc, row) => {
+    acc.relevance += Number(row?.Relevance || 0);
+    acc.length_appropriateness += Number(row?.['Length appropriateness'] || 0);
+    acc.coherence += Number(row?.Coherence || 0);
+    acc.toxicity += Number(row?.Toxicity || 0);
+    acc.bias += Number(row?.Bias || 0);
+    acc.hallucination += Number(row?.Hallucination || 0);
+    acc.average_score += Number(row?.['Overall Score'] || 0);
+    return acc;
+  }, {
+    relevance: 0,
+    length_appropriateness: 0,
+    coherence: 0,
+    toxicity: 0,
+    bias: 0,
+    hallucination: 0,
+    average_score: 0,
+  });
+
+  const count = rows.length;
+  return {
+    relevance: totals.relevance / count,
+    length_appropriateness: totals.length_appropriateness / count,
+    coherence: totals.coherence / count,
+    toxicity: totals.toxicity / count,
+    bias: totals.bias / count,
+    hallucination: totals.hallucination / count,
+    average_score: totals.average_score / count,
+  };
 }
 
 // Store evaluation results
